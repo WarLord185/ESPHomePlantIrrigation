@@ -95,7 +95,7 @@ The configuration below defines a valve that opens for 10 minutes every morning 
 ```yaml
 switch:
   - platform: gpio
-    pin: GPIO5
+    pin: 5
     name: "Irrigation Valve Zone 1"
     id: valve_zone_1
 
@@ -116,7 +116,7 @@ The following lambda reads an analog soil moisture sensor and activates the valv
 ```yaml
 sensor:
   - platform: adc
-    pin: GPIO2
+    pin: 2
     name: "Soil Moisture"
     id: soil_moisture
     update_interval: 60s
