@@ -18,7 +18,7 @@ ESPHomePlantIrrigation is an embedded systems project that delivers automated, s
 | Connectivity | Wi-Fi 6 (802.11ax), Bluetooth 5 LE (on-chip) |
 | Power Supply | 3.3 V / 5 V (board-dependent) |
 | Actuators | Solenoid valve(s) or water pump relay module |
-| Sensors (optional) | Soil moisture sensor, DHT22 / AHT10 for temperature & humidity |
+| Sensors (optional) | Soil moisture sensor, SHT40 for temperature & humidity |
 
 > **Note:** Specific wiring diagrams and GPIO pin mappings are documented in [`docs/wiring.md`](docs/wiring.md).
 
