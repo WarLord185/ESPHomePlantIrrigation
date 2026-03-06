@@ -41,7 +41,7 @@ pip install esphome
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/<WarLord185>/ESPHomePlantIrrigation.git
+git clone https://github.com/WarLord185/ESPHomePlantIrrigation.git
 cd ESPHomePlantIrrigation
 ```
 
