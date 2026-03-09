@@ -4,15 +4,18 @@ esphome:
   min_version: 2025.11.0
   name_add_mac_suffix: false
   on_boot:
-    priority: 600
-    then:
-      - lambda: |-
-          for (int i = 0; i < 128; i++) {
-            id(temp_buf)[i]  = NAN;
-            id(hum_buf)[i]   = NAN;
-            id(soil_buf)[i]  = NAN;
-            id(water_buf)[i] = NAN;
-          }
+    - priority: 600
+      then:
+        - lambda: |-
+            for (int i = 0; i < 128; i++) {
+              id(temp_buf)[i]  = NAN;
+              id(hum_buf)[i]   = NAN;
+              id(soil_buf)[i]  = NAN;
+              id(water_buf)[i] = NAN;
+            }
+    - priority: -100
+      then:
+        - delay: 3s
 
 esp32:
   variant: esp32c6
@@ -65,6 +68,10 @@ globals:
     restore_value: no
     initial_value: '0'
   - id: soil_accum
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: water_accum
     type: float
     restore_value: no
     initial_value: '0.0'
@@ -229,42 +236,19 @@ sensor:
               if (h > 100) h = 100;
               id(humidity_pwm).set_level(h / 100.0f);
 
-  # ── RCWL-1670 water tank level sensor ──
-  # Wiring: ESP GPIO10 → sensor Trig (RX pin)
-  #         sensor Echo (TX pin) → ESP GPIO0
+  # ── RCWL-1670 water tank level sensor (GPIO trigger/echo mode) ──
+  # GPIO0 = Trig → sensor RX pin
+  # GPIO4 = Echo ← sensor TX pin (via level shifter)
   - platform: ultrasonic
-    trigger_pin:
-      number: 10
-      mode:
-        output: true
-    echo_pin:
-      number: 0
-      mode:
-        input: true
+    trigger_pin: 0
+    echo_pin: 4
     name: "Water Tank Distance"
     id: water_distance
     internal: true
-    update_interval: 10s
+    update_interval: never
     pulse_time: 10us
     timeout: 4m
-    filters:
-      - sliding_window_moving_average:
-          window_size: 3
-          send_every: 1
-    on_value:
-      then:
-        - lambda: |-
-            if (isnan(x)) return;
-            float dist_cm = x * 100.0f;
-            const float blind_cm = 2.0f;
-            float usable = id(tank_height_cm);
-            if (usable <= 0) usable = 1;
-            if (dist_cm < blind_cm) dist_cm = blind_cm;
-            if (dist_cm > (usable + blind_cm)) dist_cm = usable + blind_cm;
-            float pct = ((usable + blind_cm - dist_cm) / usable) * 100.0f;
-            if (pct < 0)   pct = 0;
-            if (pct > 100) pct = 100;
-            id(water_level).publish_state(pct);
+
   - platform: template
     name: "Water Tank Level"
     id: water_level
@@ -363,9 +347,10 @@ display:
       }
 
 interval:
-  - interval: 30s
+  - interval: 45s
     then:
       - script.execute: soil_sample_avg
+      - script.execute: water_sample_avg
 
 button:
   - platform: template
@@ -407,6 +392,28 @@ script:
           if (avg < 0) avg = 0;
           if (avg > 100) avg = 100;
           id(soil_moisture).publish_state(avg);
+  - id: water_sample_avg
+    mode: single
+    then:
+      - lambda: id(water_accum) = 0.0;
+      - repeat:
+          count: 3
+          then:
+            - component.update: water_distance
+            - lambda: |-
+                float d = id(water_distance).state;
+                if (!isnan(d)) id(water_accum) += d;
+            - delay: 500ms
+      - lambda: |-
+          float avg = id(water_accum) / 3.0f;
+          if (isnan(avg)) return;
+          const float full_m  = 0.02f;
+          const float empty_m = id(tank_height_cm) / 100.0f + 0.02f;
+          float pct = ((100.0f) / (full_m - empty_m)) * avg
+                    + (100.0f - (((100.0f) / (full_m - empty_m)) * full_m));
+          if (pct < 0)   pct = 0;
+          if (pct > 100) pct = 100;
+          id(water_level).publish_state(pct);
   - id: soil_calibrate_read
     mode: single
     then:
