@@ -16,6 +16,8 @@ esphome:
     - priority: -100
       then:
         - delay: 3s
+        - output.turn_off: pump_output
+        - output.turn_off: pump_led_output
 
 esp32:
   variant: esp32c6
@@ -39,6 +41,17 @@ wifi:
     password: "qwertyuiop"
 
 captive_portal:
+
+deep_sleep:
+  id: deep_sleep_ctrl
+  wakeup_pin:
+    number: GPIO3
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  wakeup_pin_mode: KEEP_AWAKE
 
 i2c:
   sda: 6
@@ -95,7 +108,7 @@ output:
     id: humidity_pwm
     frequency: 1000Hz
   - platform: gpio
-    pin: 3
+    pin: 18
     id: pump_led_output
   - platform: gpio
     pin: 12
@@ -110,10 +123,10 @@ switch:
     turn_on_action:
       then:
         - lambda: |-
-            float h = id(room_humidity).state;
-            if (isnan(h) || h < 0) h = 0;
-            if (h > 100) h = 100;
-            id(humidity_pwm).set_level(h / 100.0f);
+            float w = id(water_last);
+            if (isnan(w) || w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
     turn_off_action:
       then:
         - lambda: id(humidity_pwm).set_level(0.0f);
@@ -169,6 +182,23 @@ binary_sensor:
     on_press:
       then:
         - switch.toggle: pump_switch
+  - platform: gpio
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      allow_other_uses: true
+    id: sleep_button
+    name: "Sleep Button"
+    device_class: power
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      then:
+        - logger.log: "Sleep button pressed — entering deep sleep"
+        - deep_sleep.enter: deep_sleep_ctrl
 
 sensor:
   - platform: template
@@ -230,11 +260,6 @@ sensor:
           - lambda: |-
               id(hum_buf)[id(buf_index)] = x;
               id(buf_index) = (id(buf_index) + 1) % 128;
-              if (!id(led_bar_enabled).state) return;
-              float h = x;
-              if (h < 0) h = 0;
-              if (h > 100) h = 100;
-              id(humidity_pwm).set_level(h / 100.0f);
 
   # ── RCWL-1670 water tank level sensor (GPIO trigger/echo mode) ──
   # GPIO0 = Trig → sensor RX pin
@@ -261,6 +286,11 @@ sensor:
         - lambda: |-
             id(water_last) = x;
             id(water_buf)[id(buf_index)] = x;
+            if (!id(led_bar_enabled).state) return;
+            float w = x;
+            if (w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
 
 font:
   - file: "gfonts://Roboto"
@@ -509,11 +539,11 @@ script:
       - delay: 500ms
       - lambda: |-
           if (id(led_bar_enabled).state) {
-            float h = id(room_humidity).state;
-            if (isnan(h) || h < 0) h = 0;
-            if (h > 100) h = 100;
-            id(humidity_pwm).set_level(h / 100.0f);
-            ESP_LOGI("test", "Test complete. Restored to %.1f%%", h);
+            float w = id(water_last);
+            if (isnan(w) || w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
+            ESP_LOGI("test", "Test complete. Restored to %.1f%%", w);
           } else {
             id(humidity_pwm).set_level(0.0f);
             ESP_LOGI("test", "Test complete. LED bar off (switch is off).");
