@@ -1,0 +1,975 @@
+esphome:
+  name: plantirrigation
+  friendly_name: PlantIrrigation
+  on_boot:
+    - priority: 800
+      then:
+        - delay: 2s
+    - priority: 600
+      then:
+        - lambda: |-
+            for (int i = 0; i < 128; i++) {
+              id(temp_buf)[i]  = NAN;
+              id(hum_buf)[i]   = NAN;
+              id(soil_buf)[i]  = NAN;
+              id(water_buf)[i] = NAN;
+            }
+    - priority: -100
+      then:
+        - delay: 3s
+        - output.turn_off: pump_output
+        - output.turn_off: pump_led_output
+        - script.execute: sensing_loop
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: !secret ap_ssid
+    password: !secret ap_password
+
+captive_portal:
+
+deep_sleep:
+  id: deep_sleep_ctrl
+  wakeup_pin:
+    number: GPIO3
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  wakeup_pin_mode: KEEP_AWAKE
+
+i2c:
+  sda: 6
+  scl: 7
+  scan: true
+  frequency: 100000Hz
+
+globals:
+  # ── Graph buffers ──
+  - id: display_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: temp_buf
+    type: float[128]
+    restore_value: no
+  - id: hum_buf
+    type: float[128]
+    restore_value: no
+  - id: soil_buf
+    type: float[128]
+    restore_value: no
+  - id: water_buf
+    type: float[128]
+    restore_value: no
+  - id: buf_index
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # ── Sampling accumulators ──
+  - id: soil_accum
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: water_accum
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: soil_last
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: water_last
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  # ── Tank geometry ──
+  - id: tank_height_cm
+    type: float
+    restore_value: no
+    initial_value: '398.0'
+  # ── Settings state ──
+  - id: in_settings
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: settings_cursor
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: settings_scroll
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # submode: 0=list  1=interval adjust  2=soil dry cal  3=soil wet cal
+  - id: settings_submode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # ── Persistent user settings ──
+  - id: sensing_interval_idx
+    type: int
+    restore_value: yes
+    initial_value: '2'
+  - id: soil_dry_v
+    type: float
+    restore_value: yes
+    initial_value: '2.5820'
+  - id: soil_wet_v
+    type: float
+    restore_value: yes
+    initial_value: '0.8960'
+  - id: soil_raw_latest
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  # ── Alert one-shot flags (reset when condition clears) ──
+  - id: tank_alert_sent
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: temp_alert_sent
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+output:
+  - platform: ledc
+    pin: 2
+    id: humidity_pwm
+    frequency: 1000Hz
+  - platform: gpio
+    pin: 21
+    id: pump_led_output
+  - platform: gpio
+    pin: 1
+    id: pump_output
+
+  - platform: ledc
+    pin: 22
+    id: buzzer_output
+    frequency: 1000Hz
+
+switch:
+  - platform: template
+    name: "LED Bar Graph"
+    id: led_bar_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      then:
+        - lambda: |-
+            float w = id(water_last);
+            if (isnan(w) || w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
+    turn_off_action:
+      then:
+        - lambda: id(humidity_pwm).set_level(0.0f);
+
+  - platform: template
+    name: "Water Pump"
+    id: pump_switch
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      then:
+        - output.turn_on: pump_output
+        - output.turn_on: pump_led_output
+    turn_off_action:
+      then:
+        - output.turn_off: pump_output
+        - output.turn_off: pump_led_output
+
+binary_sensor:
+  # ── GPIO18: BACK — prev display mode (normal) / navigate up (settings) ──
+  - platform: gpio
+    pin:
+      number: 18
+      mode: INPUT
+    id: back_button
+    name: "Back Button"
+    device_class: power
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(in_settings);'
+            then:
+              - script.execute: settings_nav_back
+            else:
+              - lambda: |-
+                  id(display_mode) = (id(display_mode) + 4) % 5;
+
+  # ── GPIO19: SELECT — hold 5s to enter/exit settings ──
+  #    Short press: enters settings confirm action (settings mode)
+  #    Normal mode: no short-press action (hold only)
+  - platform: gpio
+    pin:
+      number: 19
+      mode: INPUT
+    id: select_button
+    name: "Select Button"
+    device_class: power
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - script.execute: hold_select_timer
+    on_release:
+      then:
+        - if:
+            condition:
+              script.is_running: hold_select_timer
+            then:
+              # Short press — timer still running, so cancel and handle
+              - script.stop: hold_select_timer
+              - if:
+                  condition:
+                    lambda: 'return id(in_settings);'
+                  then:
+                    - script.execute: settings_select_action
+              # Normal mode: short press of select does nothing
+
+  # ── GPIO20: FORWARD — next display mode (normal) / navigate down (settings) ──
+  - platform: gpio
+    pin:
+      number: 20
+      mode: INPUT
+    id: forward_button
+    name: "Forward Button"
+    device_class: power
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(in_settings);'
+            then:
+              - script.execute: settings_nav_forward
+            else:
+              - lambda: |-
+                  id(display_mode) = (id(display_mode) + 1) % 5;
+
+  # ── GPIO3: Sleep — disabled while in settings ──
+  - platform: gpio
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      allow_other_uses: true
+    id: sleep_button
+    name: "Sleep Button"
+    device_class: power
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(in_settings);'
+            then:
+              - logger.log: "Sleep button pressed — entering deep sleep"
+              - deep_sleep.enter: deep_sleep_ctrl
+
+sensor:
+  - platform: template
+    name: "Soil Moisture Raw ADC"
+    id: soil_moisture_raw
+    unit_of_measurement: "V"
+    accuracy_decimals: 4
+    update_interval: never
+
+  # Raw voltage — calibration applied dynamically in soil_sample_avg
+  - platform: adc
+    pin: 0
+    name: "Soil Moisture ADC Internal"
+    id: soil_moisture_adc
+    unit_of_measurement: "V"
+    attenuation: 12db
+    update_interval: never
+    internal: true
+
+  - platform: template
+    name: "Soil Moisture"
+    id: soil_moisture
+    unit_of_measurement: "%"
+    device_class: moisture
+    accuracy_decimals: 1
+    update_interval: never
+    on_value:
+      then:
+        - lambda: |-
+            id(soil_last) = x;
+            id(soil_buf)[id(buf_index)] = x;
+        - if:
+            condition:
+              # Auto-pump suppressed while in settings
+              lambda: 'return x <= 30.0 && !id(pump_switch).state && !id(in_settings);'
+            then:
+              - switch.turn_on: pump_switch
+              - delay: 30s
+              - switch.turn_off: pump_switch
+
+  - platform: sht4x
+    precision: High
+    update_interval: 30s
+    temperature:
+      name: "Room Temperature"
+      id: room_temp
+      on_value:
+        then:
+          - lambda: id(temp_buf)[id(buf_index)] = x;
+          # ── High temperature alert (≥30°C) ──
+          - if:
+              condition:
+                lambda: 'return x >= 30.0f && !id(temp_alert_sent);'
+              then:
+                - lambda: id(temp_alert_sent) = true;
+                - logger.log:
+                    format: "ALERT: High ambient temperature %.1f C — sending HA notification"
+                    args: ['x']
+                    level: WARN
+                - homeassistant.service:
+                    service: notify.notify
+                    variables:
+                      temp: return x;
+                    data_template:
+                      title: "🌡️ High Ambient Temperature"
+                      message: "The ambient temperature is {{ temp | round(1) }}°C."
+          - if:
+              condition:
+                lambda: 'return x < 28.0f && id(temp_alert_sent);'
+              then:
+                - lambda: id(temp_alert_sent) = false;
+    humidity:
+      name: "Room Humidity"
+      id: room_humidity
+      on_value:
+        then:
+          - lambda: |-
+              id(hum_buf)[id(buf_index)] = x;
+              id(buf_index) = (id(buf_index) + 1) % 128;
+
+  # ── RCWL-1670 water tank level sensor ──
+  # GPIO15 = Trig → sensor RX pin
+  # GPIO23 = Echo ← sensor TX pin (via level shifter)
+  - platform: ultrasonic
+    trigger_pin: 15
+    echo_pin: 23
+    name: "Water Tank Distance"
+    id: water_distance
+    internal: true
+    update_interval: never
+    pulse_time: 10us
+    timeout: 4m
+
+  - platform: template
+    name: "Water Tank Level"
+    id: water_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:water-percent"
+    update_interval: never
+    on_value:
+      then:
+        - lambda: |-
+            id(water_last) = x;
+            id(water_buf)[id(buf_index)] = x;
+            if (!id(led_bar_enabled).state) return;
+            float w = x;
+            if (w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
+        # ── Tank low alert (≤10%) ──
+        - if:
+            condition:
+              lambda: 'return x <= 10.0f && !id(tank_alert_sent);'
+            then:
+              - lambda: id(tank_alert_sent) = true;
+              - logger.log:
+                  format: "ALERT: Water tank critically low at %.1f%% — sending HA notification"
+                  args: ['x']
+                  level: WARN
+              - script.execute: buzzer_alert
+              - homeassistant.service:
+                  service: notify.notify
+                  variables:
+                    level: return x;
+                  data_template:
+                    title: "⚠️ Water Tank Critically Low"
+                    message: "Water tank level is at {{ level | int }}% — please refill soon."
+        - if:
+            condition:
+              lambda: 'return x > 15.0f && id(tank_alert_sent);'
+            then:
+              - lambda: id(tank_alert_sent) = false;
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 16
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: oled
+    setup_priority: -100
+    update_interval: 1s
+    lambda: |-
+      // ── Interval preset labels ──
+      auto interval_label = [](int i) -> const char* {
+        const char* labels[] = {
+          "10 sec","30 sec","1 min","2 min","5 min",
+          "10 min","15 min","30 min","1 hr",
+          "2 hr","4 hr","6 hr","12 hr"
+        };
+        if (i < 0)  i = 0;
+        if (i > 12) i = 12;
+        return labels[i];
+      };
+
+      if (id(in_settings)) {
+
+        int submode = id(settings_submode);
+        int cursor  = id(settings_cursor);
+        int scroll  = id(settings_scroll);
+
+        if (submode == 1) {
+          // ════════════════════════════════
+          // Interval Adjust Sub-page
+          // ════════════════════════════════
+          it.printf(0, 0, id(font_small), "Sensing Interval");
+          it.line(0, 11, 128, 11);
+          int idx = id(sensing_interval_idx);
+          // Draw progress bar  (x=12, y=18, w=104, h=8)
+          int fill = (idx == 0) ? 1 : (int)((float)idx / 12.0f * 104.0f);
+          it.rectangle(12, 18, 104, 8);
+          it.filled_rectangle(12, 18, fill, 8);
+          it.printf(20, 29, id(font_small), "%s", interval_label(idx));
+          it.line(0, 52, 128, 52);
+          it.printf(0, 54, id(font_small), "DEC  SAVE  INC");
+
+        } else if (submode == 2 || submode == 3) {
+          // ════════════════════════════════
+          // Soil Cal Sub-page (DRY or WET)
+          // ════════════════════════════════
+          if (submode == 2)
+            it.printf(0, 0, id(font_small), "Soil Cal DRY 0%%");
+          else
+            it.printf(0, 0, id(font_small), "Soil Cal WET 100%%");
+          it.line(0, 11, 128, 11);
+          if (isnan(id(soil_raw_latest)))
+            it.printf(0, 13, id(font_small), "Live: reading...");
+          else
+            it.printf(0, 13, id(font_small), "Live: %.4fV", id(soil_raw_latest));
+          float saved = (submode == 2) ? id(soil_dry_v) : id(soil_wet_v);
+          it.printf(0, 25, id(font_small), "Saved:%.4fV", saved);
+          it.printf(0, 37, id(font_small), "SEL=save BK=back");
+          it.line(0, 52, 128, 52);
+          it.printf(0, 54, id(font_small), "BK   SAVE  BK");
+
+        } else {
+          // ════════════════════════════════
+          // Settings List (4 items visible)
+          // ════════════════════════════════
+          it.printf(0, 0, id(font_small), "SETTINGS");
+          it.line(0, 11, 128, 11);
+
+          // Render 4 visible items
+          for (int i = 0; i < 4; i++) {
+            int item = scroll + i;
+            if (item > 6) break;
+            int y = 13 + i * 11;
+            bool sel = (item == cursor);
+            char pfx = sel ? '>' : ' ';
+            switch (item) {
+              case 0:
+                it.printf(0, y, id(font_small), "%c Intvl:%s",
+                  pfx, interval_label(id(sensing_interval_idx)));
+                break;
+              case 1:
+                it.printf(0, y, id(font_small), "%c Poll Sensors", pfx);
+                break;
+              case 2:
+                it.printf(0, y, id(font_small), "%c LED Bar:%s",
+                  pfx, id(led_bar_enabled).state ? "ON" : "OFF");
+                break;
+              case 3:
+                it.printf(0, y, id(font_small), "%c Pump:%s",
+                  pfx, id(pump_switch).state ? "ON" : "OFF");
+                break;
+              case 4:
+                it.printf(0, y, id(font_small), "%c Soil Cal DRY", pfx);
+                break;
+              case 5:
+                it.printf(0, y, id(font_small), "%c Soil Cal WET", pfx);
+                break;
+              case 6:
+                it.printf(0, y, id(font_small), "%c Exit Settings", pfx);
+                break;
+            }
+          }
+
+          it.line(0, 57, 128, 57);
+          it.printf(0, 59, id(font_small), "BK   SEL   FW");
+        }
+
+      } else {
+        // ════════════════════════════════
+        // Normal Display Modes
+        // ════════════════════════════════
+        auto draw_graph = [&](float* buf, int cur_idx, float y_min, float y_max,
+                              int gx, int gy, int gw, int gh) {
+          it.line(gx, gy, gx, gy + gh);
+          it.line(gx, gy + gh, gx + gw, gy + gh);
+          float range = y_max - y_min;
+          if (range == 0) range = 1;
+          for (int n = 0; n < gw; n++) {
+            int bidx = (cur_idx + n) % 128;
+            float v = buf[bidx];
+            if (isnan(v)) continue;
+            float norm = (v - y_min) / range;
+            if (norm < 0) norm = 0;
+            if (norm > 1) norm = 1;
+            int py = gy + gh - (int)(norm * gh);
+            it.draw_pixel_at(gx + n, py);
+          }
+        };
+
+        if (id(display_mode) == 0) {
+          // Mode 0: Temperature graph
+          it.printf(0,  0, id(font_small), "Temperature (C)");
+          it.printf(80, 0, id(font_small), "%.1f C", id(room_temp).state);
+          draw_graph(id(temp_buf), id(buf_index), 15.0, 40.0, 0, 12, 128, 50);
+        } else if (id(display_mode) == 1) {
+          // Mode 1: Humidity graph
+          it.printf(0,  0, id(font_small), "Humidity (%%)");
+          it.printf(85, 0, id(font_small), "%.1f%%", id(room_humidity).state);
+          draw_graph(id(hum_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
+        } else if (id(display_mode) == 2) {
+          // Mode 2: Soil moisture graph
+          it.printf(0, 0, id(font_small), "Soil Moisture (%%)");
+          if (isnan(id(soil_last)))
+            it.printf(75, 0, id(font_small), "-.-%% ");
+          else
+            it.printf(75, 0, id(font_small), "%.1f%%", id(soil_last));
+          draw_graph(id(soil_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
+        } else if (id(display_mode) == 3) {
+          // Mode 3: Water tank graph
+          it.printf(0, 0, id(font_small), "Water Tank (%%)");
+          if (isnan(id(water_last)))
+            it.printf(80, 0, id(font_small), "-.-%% ");
+          else
+            it.printf(80, 0, id(font_small), "%.1f%%", id(water_last));
+          draw_graph(id(water_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
+        } else {
+          // Mode 4: Summary 2×2 grid
+          it.printf(0,  0,  id(font_small),  "Temperature");
+          it.printf(65, 0,  id(font_small),  "Humidity");
+          it.line(0, 11, 128, 11);
+          it.printf(0,  13, id(font_medium), "%.1fC",  id(room_temp).state);
+          it.printf(65, 13, id(font_medium), "%.0f%%", id(room_humidity).state);
+          it.printf(0,  34, id(font_small),  "Soil Moisture");
+          it.printf(65, 34, id(font_small),  "Water Tank");
+          it.line(0, 45, 128, 45);
+          if (isnan(id(soil_last)))
+            it.printf(0,  46, id(font_medium), "-.-%%");
+          else
+            it.printf(0,  46, id(font_medium), "%.1f%%", id(soil_last));
+          if (isnan(id(water_last)))
+            it.printf(65, 46, id(font_medium), "-.-%%");
+          else
+            it.printf(65, 46, id(font_medium), "%.1f%%", id(water_last));
+        }
+      }
+
+interval:
+  # Live ADC polling for soil cal sub-pages
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(in_settings) && (id(settings_submode) == 2 || id(settings_submode) == 3);'
+          then:
+            - component.update: soil_moisture_adc
+            - lambda: id(soil_raw_latest) = id(soil_moisture_adc).state;
+
+button:
+  - platform: template
+    name: "Test LED Bar Graph"
+    on_press:
+      then:
+        - script.execute: test_led_bar
+  - platform: template
+    name: "Soil Cal: Read Raw ADC"
+    on_press:
+      then:
+        - script.execute: soil_calibrate_read
+  - platform: template
+    name: "Soil Cal: Save Dry Value"
+    on_press:
+      then:
+        - script.execute: soil_calibrate_dry
+  - platform: template
+    name: "Soil Cal: Save Wet Value"
+    on_press:
+      then:
+        - script.execute: soil_calibrate_wet
+
+script:
+  # ── Hold SELECT 5s to toggle settings ──
+  - id: hold_select_timer
+    mode: single
+    then:
+      - delay: 5s
+      - lambda: |-
+          id(in_settings) = !id(in_settings);
+          id(settings_cursor)  = 0;
+          id(settings_scroll)  = 0;
+          id(settings_submode) = 0;
+
+  # ── Settings: navigate up / decrease ──
+  - id: settings_nav_back
+    mode: single
+    then:
+      - lambda: |-
+          int sub = id(settings_submode);
+          if (sub == 1) {
+            // Decrease interval
+            int idx = id(sensing_interval_idx) - 1;
+            if (idx < 0) idx = 0;
+            id(sensing_interval_idx) = idx;
+          } else if (sub == 2 || sub == 3) {
+            // Return to list from cal sub-page
+            id(settings_submode) = 0;
+          } else {
+            // Move cursor up
+            int c = id(settings_cursor) - 1;
+            if (c < 0) c = 0;
+            id(settings_cursor) = c;
+            if (c < id(settings_scroll))
+              id(settings_scroll) = c;
+          }
+
+  # ── Settings: navigate down / increase ──
+  - id: settings_nav_forward
+    mode: single
+    then:
+      - lambda: |-
+          int sub = id(settings_submode);
+          if (sub == 1) {
+            // Increase interval
+            int idx = id(sensing_interval_idx) + 1;
+            if (idx > 12) idx = 12;
+            id(sensing_interval_idx) = idx;
+          } else if (sub == 2 || sub == 3) {
+            // Return to list from cal sub-page
+            id(settings_submode) = 0;
+          } else {
+            // Move cursor down
+            int c = id(settings_cursor) + 1;
+            if (c > 6) c = 6;
+            id(settings_cursor) = c;
+            if (c >= id(settings_scroll) + 4)
+              id(settings_scroll) = c - 3;
+          }
+
+  # ── Settings: confirm / execute current item ──
+  # Uses outer if/else to ensure submode and cursor actions
+  # are fully mutually exclusive with no double-fire risk.
+  - id: settings_select_action
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(settings_submode) != 0;'
+          then:
+            # ── Submode actions ──
+            - if:
+                condition:
+                  lambda: 'return id(settings_submode) == 1;'
+                then:
+                  # Save interval, restart sensing loop
+                  - lambda: id(settings_submode) = 0;
+                  - script.stop: sensing_loop
+                  - script.execute: sensing_loop
+            - if:
+                condition:
+                  lambda: 'return id(settings_submode) == 2;'
+                then:
+                  # Save dry calibration point
+                  - lambda: |-
+                      if (!isnan(id(soil_raw_latest)))
+                        id(soil_dry_v) = id(soil_raw_latest);
+            - if:
+                condition:
+                  lambda: 'return id(settings_submode) == 3;'
+                then:
+                  # Save wet calibration point
+                  - lambda: |-
+                      if (!isnan(id(soil_raw_latest)))
+                        id(soil_wet_v) = id(soil_raw_latest);
+          else:
+            # ── List item actions (submode == 0) ──
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 0;'
+                then:
+                  - lambda: id(settings_submode) = 1;
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 1;'
+                then:
+                  - script.execute: soil_sample_avg
+                  - script.execute: water_sample_avg
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 2;'
+                then:
+                  - switch.toggle: led_bar_enabled
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 3;'
+                then:
+                  - switch.toggle: pump_switch
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 4;'
+                then:
+                  - lambda: id(settings_submode) = 2;
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 5;'
+                then:
+                  - lambda: id(settings_submode) = 3;
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 6;'
+                then:
+                  - lambda: |-
+                      id(in_settings)      = false;
+                      id(settings_submode) = 0;
+
+  # ── Variable-interval sensing loop ──
+  - id: sensing_loop
+    mode: queued
+    max_runs: 2
+    then:
+      - script.execute: soil_sample_avg
+      - script.execute: water_sample_avg
+      - delay: !lambda |-
+          const uint32_t intervals_ms[] = {
+            10000UL,    //  0 — 10 sec
+            30000UL,    //  1 — 30 sec
+            60000UL,    //  2 — 1 min  (default)
+            120000UL,   //  3 — 2 min
+            300000UL,   //  4 — 5 min
+            600000UL,   //  5 — 10 min
+            900000UL,   //  6 — 15 min
+            1800000UL,  //  7 — 30 min
+            3600000UL,  //  8 — 1 hr
+            7200000UL,  //  9 — 2 hr
+            14400000UL, // 10 — 4 hr
+            21600000UL, // 11 — 6 hr
+            43200000UL  // 12 — 12 hr
+          };
+          int idx = id(sensing_interval_idx);
+          if (idx < 0)  idx = 0;
+          if (idx > 12) idx = 12;
+          return (uint32_t)intervals_ms[idx];
+      - script.execute: sensing_loop
+
+  # ── Soil moisture: 5-sample average with dynamic calibration ──
+  - id: soil_sample_avg
+    mode: single
+    then:
+      - lambda: id(soil_accum) = 0.0;
+      - repeat:
+          count: 5
+          then:
+            - component.update: soil_moisture_adc
+            - lambda: |-
+                float raw_v = id(soil_moisture_adc).state;
+                id(soil_raw_latest) = raw_v;
+                id(soil_moisture_raw).publish_state(raw_v);
+                id(soil_accum) += raw_v;
+            - delay: 200ms
+      - lambda: |-
+          float avg_v = id(soil_accum) / 5.0f;
+          float dry   = id(soil_dry_v);
+          float wet   = id(soil_wet_v);
+          float pct;
+          if (fabsf(wet - dry) < 0.001f) {
+            pct = 0.0f;
+          } else {
+            pct = (avg_v - dry) / (wet - dry) * 100.0f;
+          }
+          if (pct < 0)   pct = 0;
+          if (pct > 100) pct = 100;
+          id(soil_moisture).publish_state(pct);
+
+  # ── Water tank: 3-sample ultrasonic average ──
+  - id: water_sample_avg
+    mode: single
+    then:
+      - lambda: id(water_accum) = 0.0;
+      - repeat:
+          count: 3
+          then:
+            - component.update: water_distance
+            - lambda: |-
+                float d = id(water_distance).state;
+                if (!isnan(d)) id(water_accum) += d;
+            - delay: 500ms
+      - lambda: |-
+          float avg = id(water_accum) / 3.0f;
+          if (isnan(avg)) return;
+          const float full_m  = 0.02f;
+          const float empty_m = id(tank_height_cm) / 100.0f + 0.02f;
+          float pct = ((100.0f) / (full_m - empty_m)) * avg
+                    + (100.0f - (((100.0f) / (full_m - empty_m)) * full_m));
+          if (pct < 0)   pct = 0;
+          if (pct > 100) pct = 100;
+          id(water_level).publish_state(pct);
+
+  # ── HA dashboard calibration buttons (log-based) ──
+  - id: soil_calibrate_read
+    mode: single
+    then:
+      - lambda: |-
+          ESP_LOGI("soil_cal", "==============================");
+          ESP_LOGI("soil_cal", " SOIL CALIBRATION - RAW READ");
+          ESP_LOGI("soil_cal", "==============================");
+      - repeat:
+          count: 5
+          then:
+            - component.update: soil_moisture_adc
+            - lambda: |-
+                float raw_v = id(soil_moisture_adc).state;
+                id(soil_raw_latest) = raw_v;
+                ESP_LOGI("soil_cal", "  Raw ADC: %.4f V", raw_v);
+            - delay: 1s
+      - lambda: |-
+          ESP_LOGI("soil_cal", "Dry(0%%): %.4f V  Wet(100%%): %.4f V",
+            id(soil_dry_v), id(soil_wet_v));
+          ESP_LOGI("soil_cal", "==============================");
+
+  - id: soil_calibrate_dry
+    mode: single
+    then:
+      - component.update: soil_moisture_adc
+      - lambda: |-
+          float raw_v = id(soil_moisture_adc).state;
+          id(soil_dry_v)       = raw_v;
+          id(soil_raw_latest)  = raw_v;
+          ESP_LOGI("soil_cal", "DRY (0%%) saved: %.4f V", raw_v);
+
+  - id: soil_calibrate_wet
+    mode: single
+    then:
+      - component.update: soil_moisture_adc
+      - lambda: |-
+          float raw_v = id(soil_moisture_adc).state;
+          id(soil_wet_v)       = raw_v;
+          id(soil_raw_latest)  = raw_v;
+          ESP_LOGI("soil_cal", "WET (100%%) saved: %.4f V", raw_v);
+
+  # ── Buzzer alert: 3 short beeps (tank low warning) ──
+  - id: buzzer_alert
+    mode: single
+    then:
+      - repeat:
+          count: 3
+          then:
+            - lambda: id(buzzer_output).set_level(0.5f);
+            - delay: 200ms
+            - lambda: id(buzzer_output).set_level(0.0f);
+            - delay: 150ms
+
+  # ── LED bar graph test sweep ──
+  - id: test_led_bar
+    mode: single
+    then:
+      - lambda: ESP_LOGI("test", "Starting LED bar graph test...");
+      - lambda: id(humidity_pwm).set_level(0.0f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.1f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.2f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.3f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.4f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.5f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.6f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.7f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.8f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.9f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(1.0f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.9f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.8f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.7f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.6f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.5f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.4f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.3f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.2f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.1f);
+      - delay: 500ms
+      - lambda: id(humidity_pwm).set_level(0.0f);
+      - delay: 500ms
+      - lambda: |-
+          if (id(led_bar_enabled).state) {
+            float w = id(water_last);
+            if (isnan(w) || w < 0) w = 0;
+            if (w > 100) w = 100;
+            id(humidity_pwm).set_level(w / 100.0f);
+            ESP_LOGI("test", "Test complete. Restored to %.1f%%", w);
+          } else {
+            id(humidity_pwm).set_level(0.0f);
+            ESP_LOGI("test", "Test complete. LED bar off (switch is off).");
+          }
