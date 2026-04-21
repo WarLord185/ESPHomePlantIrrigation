@@ -30,6 +30,7 @@ esp32:
 logger:
 
 api:
+  id: api_server
   encryption:
     key: !secret api_encryption_key
 
@@ -105,7 +106,7 @@ globals:
   # ── Tank geometry ──
   - id: tank_height_cm
     type: float
-    restore_value: no
+    restore_value: yes
     initial_value: '398.0'
   # ── Settings state ──
   - id: in_settings
@@ -121,6 +122,7 @@ globals:
     restore_value: no
     initial_value: '0'
   # submode: 0=list  1=interval adjust  2=soil dry cal  3=soil wet cal
+  #          4=tank height  5=pump duration
   - id: settings_submode
     type: int
     restore_value: no
@@ -142,7 +144,19 @@ globals:
     type: float
     restore_value: no
     initial_value: 'NAN'
-  # ── Alert one-shot flags (reset when condition clears) ──
+  # ── Pump settings ──
+  # pump_duration_idx: index into preset table (default 5 = 30s)
+  # Presets: 1s,5s,10s,15s,20s,30s,45s,1min,2min,3min,5min
+  - id: pump_duration_idx
+    type: int
+    restore_value: yes
+    initial_value: '5'
+  # pump_auto_enabled: whether the auto-pump trigger is active
+  - id: pump_auto_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  # ── Alert one-shot flags ──
   - id: tank_alert_sent
     type: bool
     restore_value: no
@@ -163,7 +177,6 @@ output:
   - platform: gpio
     pin: 1
     id: pump_output
-
   - platform: ledc
     pin: 22
     id: buzzer_output
@@ -201,7 +214,7 @@ switch:
         - output.turn_off: pump_led_output
 
 binary_sensor:
-  # ── GPIO18: BACK — prev display mode (normal) / navigate up (settings) ──
+  # ── GPIO18: BACK ──
   - platform: gpio
     pin:
       number: 18
@@ -223,8 +236,6 @@ binary_sensor:
                   id(display_mode) = (id(display_mode) + 4) % 5;
 
   # ── GPIO19: SELECT — hold 5s to enter/exit settings ──
-  #    Short press: enters settings confirm action (settings mode)
-  #    Normal mode: no short-press action (hold only)
   - platform: gpio
     pin:
       number: 19
@@ -243,16 +254,14 @@ binary_sensor:
             condition:
               script.is_running: hold_select_timer
             then:
-              # Short press — timer still running, so cancel and handle
               - script.stop: hold_select_timer
               - if:
                   condition:
                     lambda: 'return id(in_settings);'
                   then:
                     - script.execute: settings_select_action
-              # Normal mode: short press of select does nothing
 
-  # ── GPIO20: FORWARD — next display mode (normal) / navigate down (settings) ──
+  # ── GPIO20: FORWARD ──
   - platform: gpio
     pin:
       number: 20
@@ -304,7 +313,6 @@ sensor:
     accuracy_decimals: 4
     update_interval: never
 
-  # Raw voltage — calibration applied dynamically in soil_sample_avg
   - platform: adc
     pin: 0
     name: "Soil Moisture ADC Internal"
@@ -328,12 +336,10 @@ sensor:
             id(soil_buf)[id(buf_index)] = x;
         - if:
             condition:
-              # Auto-pump suppressed while in settings
-              lambda: 'return x <= 30.0 && !id(pump_switch).state && !id(in_settings);'
+              # Auto-pump: soil dry, pump not already running, not in settings, auto enabled
+              lambda: 'return x <= 30.0 && !id(pump_switch).state && !id(in_settings) && id(pump_auto_enabled);'
             then:
-              - switch.turn_on: pump_switch
-              - delay: 30s
-              - switch.turn_off: pump_switch
+              - script.execute: pump_run
 
   - platform: sht4x
     precision: High
@@ -344,14 +350,13 @@ sensor:
       on_value:
         then:
           - lambda: id(temp_buf)[id(buf_index)] = x;
-          # ── High temperature alert (≥30°C) ──
           - if:
               condition:
                 lambda: 'return x >= 30.0f && !id(temp_alert_sent);'
               then:
                 - lambda: id(temp_alert_sent) = true;
                 - logger.log:
-                    format: "ALERT: High ambient temperature %.1f C — sending HA notification"
+                    format: "ALERT: High ambient temperature %.1f C"
                     args: ['x']
                     level: WARN
                 - homeassistant.service:
@@ -375,9 +380,6 @@ sensor:
               id(hum_buf)[id(buf_index)] = x;
               id(buf_index) = (id(buf_index) + 1) % 128;
 
-  # ── RCWL-1670 water tank level sensor ──
-  # GPIO15 = Trig → sensor RX pin
-  # GPIO23 = Echo ← sensor TX pin (via level shifter)
   - platform: ultrasonic
     trigger_pin: 15
     echo_pin: 23
@@ -405,14 +407,13 @@ sensor:
             if (w < 0) w = 0;
             if (w > 100) w = 100;
             id(humidity_pwm).set_level(w / 100.0f);
-        # ── Tank low alert (≤10%) ──
         - if:
             condition:
               lambda: 'return x <= 10.0f && !id(tank_alert_sent);'
             then:
               - lambda: id(tank_alert_sent) = true;
               - logger.log:
-                  format: "ALERT: Water tank critically low at %.1f%% — sending HA notification"
+                  format: "ALERT: Water tank critically low at %.1f%%"
                   args: ['x']
                   level: WARN
               - script.execute: buzzer_alert
@@ -445,7 +446,7 @@ display:
     setup_priority: -100
     update_interval: 1s
     lambda: |-
-      // ── Interval preset labels ──
+      // ── Shared label helpers ──
       auto interval_label = [](int i) -> const char* {
         const char* labels[] = {
           "10 sec","30 sec","1 min","2 min","5 min",
@@ -454,6 +455,15 @@ display:
         };
         if (i < 0)  i = 0;
         if (i > 12) i = 12;
+        return labels[i];
+      };
+      auto pump_dur_label = [](int i) -> const char* {
+        const char* labels[] = {
+          "1 sec","5 sec","10 sec","15 sec","20 sec",
+          "30 sec","45 sec","1 min","2 min","3 min","5 min"
+        };
+        if (i < 0)  i = 0;
+        if (i > 10) i = 10;
         return labels[i];
       };
 
@@ -466,17 +476,18 @@ display:
         if (submode == 1) {
           // ════════════════════════════════
           // Interval Adjust Sub-page
+          // title(y=0) | divider(y=11) | bar(y=14,h=8) | label(y=25) | divider(y=46) | hint(y=54)
+          // font_small renders from y to y+9; y=54 → pixels 54-63 fits exactly in 64px
           // ════════════════════════════════
           it.printf(0, 0, id(font_small), "Sensing Interval");
           it.line(0, 11, 128, 11);
           int idx = id(sensing_interval_idx);
-          // Draw progress bar  (x=12, y=18, w=104, h=8)
           int fill = (idx == 0) ? 1 : (int)((float)idx / 12.0f * 104.0f);
-          it.rectangle(12, 18, 104, 8);
-          it.filled_rectangle(12, 18, fill, 8);
-          it.printf(20, 29, id(font_small), "%s", interval_label(idx));
+          it.rectangle(12, 14, 104, 8);
+          it.filled_rectangle(12, 14, fill, 8);
+          it.printf(20, 25, id(font_small), "%s", interval_label(idx));
           it.line(0, 52, 128, 52);
-          it.printf(0, 54, id(font_small), "DEC  SAVE  INC");
+          it.printf(4, 54, id(font_small), "DEC   SAVE   INC");
 
         } else if (submode == 2 || submode == 3) {
           // ════════════════════════════════
@@ -495,52 +506,121 @@ display:
           it.printf(0, 25, id(font_small), "Saved:%.4fV", saved);
           it.printf(0, 37, id(font_small), "SEL=save BK=back");
           it.line(0, 52, 128, 52);
-          it.printf(0, 54, id(font_small), "BK   SAVE  BK");
+          it.printf(4, 54, id(font_small), "BK    SAVE    BK");
+
+        } else if (submode == 4) {
+          // ════════════════════════════════
+          // Tank Height Adjust Sub-page
+          // ════════════════════════════════
+          it.printf(0, 0, id(font_small), "Tank Height (cm)");
+          it.line(0, 11, 128, 11);
+          int h = (int)id(tank_height_cm);
+          int fill = (int)(((float)(h - 10) / 390.0f) * 104.0f);
+          if (fill < 1)   fill = 1;
+          if (fill > 104) fill = 104;
+          it.rectangle(12, 14, 104, 8);
+          it.filled_rectangle(12, 14, fill, 8);
+          it.printf(20, 25, id(font_small), "%d cm", h);
+          it.line(0, 52, 128, 52);
+          it.printf(4, 54, id(font_small), "DEC   SAVE   INC");
+
+        } else if (submode == 5) {
+          // ════════════════════════════════
+          // Pump Duration Adjust Sub-page
+          // Presets: 1s 5s 10s 15s 20s 30s 45s 1min 2min 3min 5min (idx 0-10)
+          // ════════════════════════════════
+          it.printf(0, 0, id(font_small), "Pump Duration");
+          it.line(0, 11, 128, 11);
+          int idx = id(pump_duration_idx);
+          int fill = (idx == 0) ? 1 : (int)((float)idx / 10.0f * 104.0f);
+          it.rectangle(12, 14, 104, 8);
+          it.filled_rectangle(12, 14, fill, 8);
+          it.printf(20, 25, id(font_small), "%s", pump_dur_label(idx));
+          it.line(0, 52, 128, 52);
+          it.printf(4, 54, id(font_small), "DEC   SAVE   INC");
 
         } else {
           // ════════════════════════════════
-          // Settings List (4 items visible)
+          // Settings List  (4 rows visible)
+          // Items 0-10, cursor max = 10
+          // Row pixel layout:
+          //   Header "SETTINGS"  y=0
+          //   divider             y=11
+          //   row0                y=13  (pixels 13-22)
+          //   row1                y=24  (pixels 24-33)
+          //   row2                y=35  (pixels 35-44)
+          //   row3                y=46  (pixels 46-55)
+          //   divider             y=44  ← sits just above row3 text? No.
+          // Actually we want footer below row3:
+          //   row3 ends at y+9 = 55, footer divider at 43 won't work.
+          // Correct layout with 4 rows + footer in 64px:
+          //   Header y=0 (h=10), divider y=11
+          //   row0 y=13, row1 y=24, row2 y=35, row3 y=46
+          //   row3 bottom edge = 46+9 = 55
+          //   No room for footer divider below — omit divider, keep footer label at y=54
+          //   But that overlaps row3. Solution: show only 3 rows + footer.
+          //   row0 y=13, row1 y=24, row2 y=35
+          //   row2 bottom = 44, divider y=45, footer y=54  ✓
+          // Use 3 visible items + persistent footer.
           // ════════════════════════════════
           it.printf(0, 0, id(font_small), "SETTINGS");
           it.line(0, 11, 128, 11);
 
-          // Render 4 visible items
-          for (int i = 0; i < 4; i++) {
+          // 3 visible rows
+          // row0=y13, row1=y24, row2=y35 (bottom edge y=44)
+          // divider y=52 (2px above footer), footer text y=54 (pixels 54-63, fits in 64px)
+          for (int i = 0; i < 3; i++) {
             int item = scroll + i;
-            if (item > 6) break;
+            if (item > 10) break;
             int y = 13 + i * 11;
             bool sel = (item == cursor);
             char pfx = sel ? '>' : ' ';
             switch (item) {
               case 0:
-                it.printf(0, y, id(font_small), "%c Intvl:%s",
+                it.printf(0, y, id(font_small), "%c Sense:%s",
                   pfx, interval_label(id(sensing_interval_idx)));
                 break;
               case 1:
-                it.printf(0, y, id(font_small), "%c Poll Sensors", pfx);
+                it.printf(0, y, id(font_small), "%c Read Sensors", pfx);
                 break;
               case 2:
                 it.printf(0, y, id(font_small), "%c LED Bar:%s",
                   pfx, id(led_bar_enabled).state ? "ON" : "OFF");
                 break;
               case 3:
-                it.printf(0, y, id(font_small), "%c Pump:%s",
-                  pfx, id(pump_switch).state ? "ON" : "OFF");
+                it.printf(0, y, id(font_small), "%c Run Pump Now", pfx);
                 break;
               case 4:
-                it.printf(0, y, id(font_small), "%c Soil Cal DRY", pfx);
+                it.printf(0, y, id(font_small), "%c Auto Pump:%s",
+                  pfx, id(pump_auto_enabled) ? "ON" : "OFF");
                 break;
               case 5:
-                it.printf(0, y, id(font_small), "%c Soil Cal WET", pfx);
+                it.printf(0, y, id(font_small), "%c Pump Dur:%s",
+                  pfx, pump_dur_label(id(pump_duration_idx)));
                 break;
               case 6:
+                it.printf(0, y, id(font_small), "%c Soil Dry Cal", pfx);
+                break;
+              case 7:
+                it.printf(0, y, id(font_small), "%c Soil Wet Cal", pfx);
+                break;
+              case 8:
+                it.printf(0, y, id(font_small), "%c Tank Ht:%dcm",
+                  pfx, (int)id(tank_height_cm));
+                break;
+              case 9:
+                it.printf(0, y, id(font_small), "%c HA:%s",
+                  pfx, id(api_server).is_connected() ? "Connected" : "No Link");
+                break;
+              case 10:
                 it.printf(0, y, id(font_small), "%c Exit Settings", pfx);
                 break;
             }
           }
 
-          it.line(0, 57, 128, 57);
-          it.printf(0, 59, id(font_small), "BK   SEL   FW");
+          // Footer: divider 2px above text, text flush to bottom of 64px display
+          it.line(0, 52, 128, 52);
+          it.printf(4, 54, id(font_small), "BK    SEL    FW");
         }
 
       } else {
@@ -566,17 +646,14 @@ display:
         };
 
         if (id(display_mode) == 0) {
-          // Mode 0: Temperature graph
           it.printf(0,  0, id(font_small), "Temperature (C)");
           it.printf(80, 0, id(font_small), "%.1f C", id(room_temp).state);
           draw_graph(id(temp_buf), id(buf_index), 15.0, 40.0, 0, 12, 128, 50);
         } else if (id(display_mode) == 1) {
-          // Mode 1: Humidity graph
           it.printf(0,  0, id(font_small), "Humidity (%%)");
           it.printf(85, 0, id(font_small), "%.1f%%", id(room_humidity).state);
           draw_graph(id(hum_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
         } else if (id(display_mode) == 2) {
-          // Mode 2: Soil moisture graph
           it.printf(0, 0, id(font_small), "Soil Moisture (%%)");
           if (isnan(id(soil_last)))
             it.printf(75, 0, id(font_small), "-.-%% ");
@@ -584,7 +661,6 @@ display:
             it.printf(75, 0, id(font_small), "%.1f%%", id(soil_last));
           draw_graph(id(soil_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
         } else if (id(display_mode) == 3) {
-          // Mode 3: Water tank graph
           it.printf(0, 0, id(font_small), "Water Tank (%%)");
           if (isnan(id(water_last)))
             it.printf(80, 0, id(font_small), "-.-%% ");
@@ -592,7 +668,6 @@ display:
             it.printf(80, 0, id(font_small), "%.1f%%", id(water_last));
           draw_graph(id(water_buf), id(buf_index), 0.0, 100.0, 0, 12, 128, 50);
         } else {
-          // Mode 4: Summary 2×2 grid
           it.printf(0,  0,  id(font_small),  "Temperature");
           it.printf(65, 0,  id(font_small),  "Humidity");
           it.line(0, 11, 128, 11);
@@ -664,15 +739,20 @@ script:
       - lambda: |-
           int sub = id(settings_submode);
           if (sub == 1) {
-            // Decrease interval
             int idx = id(sensing_interval_idx) - 1;
             if (idx < 0) idx = 0;
             id(sensing_interval_idx) = idx;
+          } else if (sub == 4) {
+            float h = id(tank_height_cm) - 10.0f;
+            if (h < 10.0f) h = 10.0f;
+            id(tank_height_cm) = h;
+          } else if (sub == 5) {
+            int idx = id(pump_duration_idx) - 1;
+            if (idx < 0) idx = 0;
+            id(pump_duration_idx) = idx;
           } else if (sub == 2 || sub == 3) {
-            // Return to list from cal sub-page
             id(settings_submode) = 0;
           } else {
-            // Move cursor up
             int c = id(settings_cursor) - 1;
             if (c < 0) c = 0;
             id(settings_cursor) = c;
@@ -687,25 +767,28 @@ script:
       - lambda: |-
           int sub = id(settings_submode);
           if (sub == 1) {
-            // Increase interval
             int idx = id(sensing_interval_idx) + 1;
             if (idx > 12) idx = 12;
             id(sensing_interval_idx) = idx;
+          } else if (sub == 4) {
+            float h = id(tank_height_cm) + 10.0f;
+            if (h > 400.0f) h = 400.0f;
+            id(tank_height_cm) = h;
+          } else if (sub == 5) {
+            int idx = id(pump_duration_idx) + 1;
+            if (idx > 10) idx = 10;
+            id(pump_duration_idx) = idx;
           } else if (sub == 2 || sub == 3) {
-            // Return to list from cal sub-page
             id(settings_submode) = 0;
           } else {
-            // Move cursor down
             int c = id(settings_cursor) + 1;
-            if (c > 6) c = 6;
+            if (c > 10) c = 10;
             id(settings_cursor) = c;
-            if (c >= id(settings_scroll) + 4)
-              id(settings_scroll) = c - 3;
+            if (c >= id(settings_scroll) + 3)
+              id(settings_scroll) = c - 2;
           }
 
   # ── Settings: confirm / execute current item ──
-  # Uses outer if/else to ensure submode and cursor actions
-  # are fully mutually exclusive with no double-fire risk.
   - id: settings_select_action
     mode: single
     then:
@@ -713,12 +796,11 @@ script:
           condition:
             lambda: 'return id(settings_submode) != 0;'
           then:
-            # ── Submode actions ──
+            # ── Submode save actions ──
             - if:
                 condition:
                   lambda: 'return id(settings_submode) == 1;'
                 then:
-                  # Save interval, restart sensing loop
                   - lambda: id(settings_submode) = 0;
                   - script.stop: sensing_loop
                   - script.execute: sensing_loop
@@ -726,7 +808,6 @@ script:
                 condition:
                   lambda: 'return id(settings_submode) == 2;'
                 then:
-                  # Save dry calibration point
                   - lambda: |-
                       if (!isnan(id(soil_raw_latest)))
                         id(soil_dry_v) = id(soil_raw_latest);
@@ -734,10 +815,21 @@ script:
                 condition:
                   lambda: 'return id(settings_submode) == 3;'
                 then:
-                  # Save wet calibration point
                   - lambda: |-
                       if (!isnan(id(soil_raw_latest)))
                         id(soil_wet_v) = id(soil_raw_latest);
+            - if:
+                condition:
+                  lambda: 'return id(settings_submode) == 4;'
+                then:
+                  # tank_height_cm already updated live; just return to list
+                  - lambda: id(settings_submode) = 0;
+            - if:
+                condition:
+                  lambda: 'return id(settings_submode) == 5;'
+                then:
+                  # pump_duration_idx already updated live; just return to list
+                  - lambda: id(settings_submode) = 0;
           else:
             # ── List item actions (submode == 0) ──
             - if:
@@ -760,24 +852,68 @@ script:
                 condition:
                   lambda: 'return id(settings_cursor) == 3;'
                 then:
-                  - switch.toggle: pump_switch
+                  # One-shot manual pump trigger for the configured duration
+                  - script.execute: pump_run
             - if:
                 condition:
                   lambda: 'return id(settings_cursor) == 4;'
                 then:
-                  - lambda: id(settings_submode) = 2;
+                  # Toggle auto-pump enable/disable
+                  - lambda: id(pump_auto_enabled) = !id(pump_auto_enabled);
             - if:
                 condition:
                   lambda: 'return id(settings_cursor) == 5;'
                 then:
-                  - lambda: id(settings_submode) = 3;
+                  - lambda: id(settings_submode) = 5;
             - if:
                 condition:
                   lambda: 'return id(settings_cursor) == 6;'
                 then:
+                  - lambda: id(settings_submode) = 2;
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 7;'
+                then:
+                  - lambda: id(settings_submode) = 3;
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 8;'
+                then:
+                  - lambda: id(settings_submode) = 4;
+            # cursor 9 = HA status (read-only, no action)
+            - if:
+                condition:
+                  lambda: 'return id(settings_cursor) == 10;'
+                then:
                   - lambda: |-
                       id(in_settings)      = false;
                       id(settings_submode) = 0;
+
+  # ── Pump run: turn on for the configured duration then off ──
+  # mode: single prevents overlapping runs (if already running, new call is ignored)
+  - id: pump_run
+    mode: single
+    then:
+      - switch.turn_on: pump_switch
+      - delay: !lambda |-
+          const uint32_t durations_ms[] = {
+            1000UL,    //  0 — 1 sec
+            5000UL,    //  1 — 5 sec
+            10000UL,   //  2 — 10 sec
+            15000UL,   //  3 — 15 sec
+            20000UL,   //  4 — 20 sec
+            30000UL,   //  5 — 30 sec  (default)
+            45000UL,   //  6 — 45 sec
+            60000UL,   //  7 — 1 min
+            120000UL,  //  8 — 2 min
+            180000UL,  //  9 — 3 min
+            300000UL   // 10 — 5 min
+          };
+          int idx = id(pump_duration_idx);
+          if (idx < 0)  idx = 0;
+          if (idx > 10) idx = 10;
+          return (uint32_t)durations_ms[idx];
+      - switch.turn_off: pump_switch
 
   # ── Variable-interval sensing loop ──
   - id: sensing_loop
